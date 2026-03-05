@@ -130,9 +130,22 @@ body {
 
 /* Sidebars */
 .sidebar {
-  position: fixed; top: 0; width: 400px; height: 100vh; background: rgba(var(--panel-bg-rgb), var(--panel-bg-opacity));
-  backdrop-filter: blur(calc(var(--acrylic-blur) + 10px)) brightness(var(--panel-brightness)); -webkit-backdrop-filter: blur(calc(var(--acrylic-blur) + 10px)) brightness(var(--panel-brightness));
-  transition: left 0.3s cubic-bezier(0.2, 0.9, 0.3, 1), right 0.3s cubic-bezier(0.2, 0.9, 0.3, 1), backdrop-filter 0.1s; z-index: 1000; color: #eef2f5; border: 1px solid rgba(255, 255, 255, 0.08);
+  position: fixed;
+  top: 0;
+  width: 400px;
+  height: 100vh;
+  background: rgba(var(--panel-bg-rgb), var(--panel-bg-opacity));
+
+  backdrop-filter: blur(var(--acrylic-blur)) brightness(var(--panel-brightness));
+  -webkit-backdrop-filter: blur(var(--acrylic-blur)) brightness(var(--panel-brightness));
+
+  transition: left 0.3s cubic-bezier(0.2, 0.9, 0.3, 1),
+              right 0.3s cubic-bezier(0.2, 0.9, 0.3, 1),
+              backdrop-filter 0.1s;
+
+  z-index: 1000;
+  color: #eef2f5;
+  border: 1px solid rgba(255, 255, 255, 0.08);
   will-change: transform;
 }
 .left-sidebar { left: -450px; border-right: 1px solid rgba(255,255,255,0.1); }

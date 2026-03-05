@@ -4,7 +4,6 @@
     return `${r}, ${g}, ${b}`;
   }
 
-  // Renamed Database to Dusk_DB
   const dbPromise = new Promise((resolve, reject) => {
     const req = window.indexedDB.open('Dusk_DB', 1);
     req.onupgradeneeded = e => e.target.result.createObjectStore('store');
@@ -32,6 +31,49 @@
     } catch(e) { return null; }
   }
 
+  // --- Offline Icon Database Storage ---
+  async function saveIconToDB(key, data) {
+    try {
+      const db = await dbPromise;
+      const tx = db.transaction('store', 'readwrite');
+      tx.objectStore('store').put(data, 'icon_' + key);
+    } catch(e) {}
+  }
+
+  async function getIconFromDB(key) {
+    try {
+      const db = await dbPromise;
+      return new Promise(res => {
+        const tx = db.transaction('store', 'readonly');
+        const req = tx.objectStore('store').get('icon_' + key);
+        req.onsuccess = () => res(req.result);
+        req.onerror = () => res(null);
+      });
+    } catch(e) { return null; }
+  }
+
+  let cachingHosts = new Set();
+  async function cacheIcon(hostname) {
+    if (cachingHosts.has(hostname)) return;
+    cachingHosts.add(hostname);
+    try {
+      const res = await fetch(`https://icon.horse/icon/${hostname}`, { mode: 'cors' });
+      if (res.ok) {
+        const blob = await res.blob();
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          saveIconToDB(hostname, reader.result);
+          cachingHosts.delete(hostname);
+        };
+        reader.readAsDataURL(blob);
+      } else {
+        cachingHosts.delete(hostname);
+      }
+    } catch(e) {
+      cachingHosts.delete(hostname);
+    }
+  }
+
   let searchEngines = [
     { id: 'duckduckgo', name: 'DuckDuckGo', query: 'https://duckduckgo.com/?q=', standard: true },
     { id: 'google', name: 'Google', query: 'https://www.google.com/search?q=', standard: true }
@@ -57,20 +99,34 @@
   let libState = { view: 'grid', search: '' };
   let clockInterval = null;
   let isEditMode = false;
+  let editingBookmarkId = null;
+  let temporaryCustomIconBase64 = null; 
   
   const fallbackIcon = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='40' height='40' viewBox='0 0 24 24' fill='none' stroke='%238aa0b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='10'></circle><line x1='2' y1='12' x2='22' y2='12'></line><path d='M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z'></path></svg>";
 
   function escapeHTML(str) { const p = document.createElement('p'); p.textContent = str; return p.innerHTML; }
 
-  function getFaviconUrl(url) {
-    let hostname;
-    try { hostname = new URL(url).hostname; } catch (e) { hostname = url.replace(/^https?:\/\//, '').replace(/\/.*$/, ''); }
-    return `https://icon.horse/icon/${hostname}`;
+  function getHostname(url) {
+    try { return new URL(url).hostname; } catch (e) { return url.replace(/^https?:\/\//, '').replace(/\/.*$/, ''); }
   }
+
+  // --- "Remember The Winner" Fallback Logic ---
+  window.handleIconFallback = function(img, url, id) {
+    const b = bookmarks.find(x => x.id === id);
+    if (img.dataset.fallbackStep !== '1') {
+      img.dataset.fallbackStep = '1';
+      const googleUrl = `https://www.google.com/s2/favicons?sz=128&domain_url=${url}`;
+      img.src = googleUrl;
+      if (b && b.autoFallback !== googleUrl) { b.autoFallback = googleUrl; saveBookmarks(); }
+    } else {
+      img.onerror = null;
+      img.src = fallbackIcon;
+      if (b && b.autoFallback !== fallbackIcon) { b.autoFallback = fallbackIcon; saveBookmarks(); }
+    }
+  };
 
   function loadData() {
     try {
-      // Renamed localStorage keys to match Dusk
       const storedB = localStorage.getItem('dusk_bookmarks'); if (storedB) bookmarks = JSON.parse(storedB);
       const storedE = localStorage.getItem('dusk_engines'); if (storedE) searchEngines = searchEngines.concat(JSON.parse(storedE));
       const storedS = localStorage.getItem('dusk_settings'); 
@@ -90,39 +146,103 @@
       const toSave = { ...settings };
       delete toSave.uploadData; 
       localStorage.setItem('dusk_settings', JSON.stringify(toSave)); 
-    } catch (e) { console.error('Failed to save settings.'); }
+    } catch (e) {}
   }
 
-  function renderFavorites() {
+  // --- PERFORMANCE: RequestAnimationFrame Wrapper for sliders ---
+  let isUpdatingTheme = false;
+  function rAFThemeUpdate() {
+    if (!isUpdatingTheme) {
+      isUpdatingTheme = true;
+      requestAnimationFrame(() => {
+        applyThemeAndBackground();
+        saveSettings();
+        isUpdatingTheme = false;
+      });
+    }
+  }
+
+  async function renderFavorites() {
     const grid = document.getElementById('favoritesGrid');
-    grid.innerHTML = bookmarks.filter(b => b.fav).map(b => `
+    const favs = bookmarks.filter(b => b.fav);
+    
+    const resolvedFavs = await Promise.all(favs.map(async b => {
+      // 1. Check for manual custom icon
+      if (b.customIcon) {
+        if (b.customIcon.startsWith('db:')) {
+          let dbData = await getIconFromDB(b.customIcon.replace('db:', ''));
+          if (dbData) return { ...b, resolvedSrc: dbData };
+        } else {
+          return { ...b, resolvedSrc: b.customIcon };
+        }
+      }
+      // 2. Check for remembered fallback winner
+      if (b.autoFallback) {
+        return { ...b, resolvedSrc: b.autoFallback };
+      }
+      // 3. Otherwise fetch from standard DB or network
+      const hostname = getHostname(b.url);
+      let src = await getIconFromDB(hostname);
+      if (!src) {
+        src = `https://icon.horse/icon/${hostname}`;
+        cacheIcon(hostname); 
+      }
+      return { ...b, resolvedSrc: src };
+    }));
+
+    grid.innerHTML = resolvedFavs.map(b => `
       <div class="bookmark-item">
         <a href="${escapeHTML(b.url)}" target="_blank" class="bookmark-link">
-          <img class="bookmark-icon" src="${escapeHTML(getFaviconUrl(b.url))}" onerror="this.src='${fallbackIcon}'" loading="lazy">
+          <img class="bookmark-icon" src="${escapeHTML(b.resolvedSrc)}" onerror="window.handleIconFallback(this, '${escapeHTML(b.url)}', ${b.id})" loading="lazy">
           <span class="bookmark-title">${escapeHTML(b.name)}</span>
         </a>
       </div>
     `).join('');
   }
 
-  function renderAppLibrary() {
+  async function renderAppLibrary() {
     const container = document.getElementById('allBookmarksContainer');
     let filtered = bookmarks.filter(b => b.name.toLowerCase().includes(libState.search.toLowerCase()));
     filtered.sort((a, b) => a.name.localeCompare(b.name));
     
+    const resolvedBookmarks = await Promise.all(filtered.map(async b => {
+      // 1. Check for manual custom icon
+      if (b.customIcon) {
+        if (b.customIcon.startsWith('db:')) {
+          let dbData = await getIconFromDB(b.customIcon.replace('db:', ''));
+          if (dbData) return { ...b, resolvedSrc: dbData };
+        } else {
+          return { ...b, resolvedSrc: b.customIcon };
+        }
+      }
+      // 2. Check for remembered fallback winner
+      if (b.autoFallback) {
+        return { ...b, resolvedSrc: b.autoFallback };
+      }
+      // 3. Otherwise fetch from standard DB or network
+      const hostname = getHostname(b.url);
+      let src = await getIconFromDB(hostname);
+      if (!src) {
+        src = `https://icon.horse/icon/${hostname}`;
+        cacheIcon(hostname);
+      }
+      return { ...b, resolvedSrc: src };
+    }));
+
     let baseClass = 'all-bookmarks-container';
     if (isEditMode) baseClass += ' edit-mode';
 
     if (libState.view === 'grid') {
       container.className = `${baseClass} lib-grid`;
-      container.innerHTML = filtered.map(b => `
+      container.innerHTML = resolvedBookmarks.map(b => `
         <div class="bookmark-item">
           <a href="${escapeHTML(b.url)}" target="_blank" class="bookmark-link">
-            <img class="bookmark-icon" src="${escapeHTML(getFaviconUrl(b.url))}" onerror="this.src='${fallbackIcon}'" loading="lazy">
+            <img class="bookmark-icon" src="${escapeHTML(b.resolvedSrc)}" onerror="window.handleIconFallback(this, '${escapeHTML(b.url)}', ${b.id})" loading="lazy">
             <span class="bookmark-title">${escapeHTML(b.name)}</span>
           </a>
           <div class="inline-actions">
-            <button class="inline-action-btn fav ${b.fav ? 'active' : ''}" data-id="${b.id}" title="Toggle Favorite"><i class="fas fa-star"></i></button>
+            <button class="inline-action-btn fav ${b.fav ? 'active' : ''}" data-id="${b.id}" title="Toggle Favorite"><i class="fas fa-thumbtack"></i></button>
+            <button class="inline-action-btn edit" data-id="${b.id}" title="Edit"><i class="fas fa-edit"></i></button>
             <button class="inline-action-btn delete" data-id="${b.id}" title="Delete"><i class="fas fa-trash-alt"></i></button>
           </div>
         </div>
@@ -130,7 +250,7 @@
     } else {
       container.className = `${baseClass} lib-list`;
       const alpha = {};
-      filtered.forEach(b => { const l = b.name.charAt(0).toUpperCase(); if(!alpha[l]) alpha[l]=[]; alpha[l].push(b); });
+      resolvedBookmarks.forEach(b => { const l = b.name.charAt(0).toUpperCase(); if(!alpha[l]) alpha[l]=[]; alpha[l].push(b); });
       let html = '';
       Object.keys(alpha).sort().forEach(letter => {
         html += `<div class="alpha-header">${letter}</div>`;
@@ -138,10 +258,11 @@
           html += `
             <div class="lib-list-item-wrapper">
               <a href="${escapeHTML(b.url)}" target="_blank" class="lib-list-item">
-                <img src="${escapeHTML(getFaviconUrl(b.url))}" onerror="this.src='${fallbackIcon}'" loading="lazy"><span class="title">${escapeHTML(b.name)}</span>
+                <img src="${escapeHTML(b.resolvedSrc)}" onerror="window.handleIconFallback(this, '${escapeHTML(b.url)}', ${b.id})" loading="lazy"><span class="title">${escapeHTML(b.name)}</span>
               </a>
               <div class="inline-actions">
-                <button class="inline-action-btn fav ${b.fav ? 'active' : ''}" data-id="${b.id}" title="Toggle Favorite"><i class="fas fa-star"></i></button>
+                <button class="inline-action-btn fav ${b.fav ? 'active' : ''}" data-id="${b.id}" title="Toggle Favorite"><i class="fas fa-thumbtack"></i></button>
+                <button class="inline-action-btn edit" data-id="${b.id}" title="Edit"><i class="fas fa-edit"></i></button>
                 <button class="inline-action-btn delete" data-id="${b.id}" title="Delete"><i class="fas fa-trash-alt"></i></button>
               </div>
             </div>`;
@@ -185,7 +306,7 @@
     list.innerHTML = searchEngines.map(e => `
       <div class="engine-option ${settings.searchEngineId === e.id ? 'selected' : ''}" data-id="${e.id}">
         <span>${e.name}</span>
-        ${!e.standard ? `<button class="delete-engine-btn" data-id="${e.id}"><i class="fas fa-trash"></i></button>` : ''}
+        ${!e.standard ? `<button class="delete-engine-btn" data-id="${e.id}" tabindex="-1"><i class="fas fa-trash"></i></button>` : ''}
       </div>
     `).join('');
 
@@ -199,6 +320,7 @@
         saveSettings(); 
         renderSearchEngines();
         document.getElementById('searchDropdown').classList.remove('active');
+        document.getElementById('search-input').focus();
       });
     });
 
@@ -337,9 +459,113 @@
         const b = bookmarks.find(x => x.id === id); if(b) b.fav = !b.fav;
       } else if (btn.classList.contains('delete')) {
         bookmarks = bookmarks.filter(x => x.id !== id);
+      } else if (btn.classList.contains('edit')) {
+        const b = bookmarks.find(x => x.id === id);
+        if (b) {
+          editingBookmarkId = id;
+          temporaryCustomIconBase64 = null;
+          document.getElementById('editBookmarkName').value = b.name || '';
+          document.getElementById('editBookmarkUrl').value = b.url || '';
+          document.getElementById('editBookmarkIconPreviewWrapper').style.display = 'none';
+          
+          if (b.customIcon && b.customIcon.startsWith('db:')) {
+            document.getElementById('editBookmarkIcon').value = '';
+            getIconFromDB(b.customIcon.replace('db:', '')).then(data => {
+              if (data) {
+                document.getElementById('editBookmarkIconPreview').style.backgroundImage = `url('${data}')`;
+                document.getElementById('editBookmarkIconPreviewWrapper').style.display = 'block';
+              }
+            });
+          } else {
+            document.getElementById('editBookmarkIcon').value = b.customIcon || '';
+          }
+          
+          document.getElementById('editBookmarkModal').style.display = 'flex';
+        }
       }
       saveBookmarks(); renderFavorites(); renderAppLibrary();
     });
+
+    // Custom Icon Local Upload Logic
+    document.getElementById('uploadIconBtn').addEventListener('click', () => document.getElementById('editBookmarkIconFile').click());
+    
+    document.getElementById('editBookmarkIconFile').addEventListener('change', (e) => {
+      const f = e.target.files[0];
+      if (f) {
+        if (f.size > 5 * 1024 * 1024) return alert('Icon image is too large (>5MB).');
+        const objectUrl = URL.createObjectURL(f);
+        const img = new Image();
+        img.onload = () => {
+          URL.revokeObjectURL(objectUrl);
+          const MAX = 256; 
+          let width = img.width; let height = img.height;
+          if (width > height) { if (width > MAX) { height *= MAX / width; width = MAX; } } 
+          else { if (height > MAX) { width *= MAX / height; height = MAX; } }
+          
+          const canvas = document.createElement('canvas');
+          canvas.width = width; canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, width, height);
+          
+          temporaryCustomIconBase64 = canvas.toDataURL('image/png');
+          document.getElementById('editBookmarkIconPreview').style.backgroundImage = `url('${temporaryCustomIconBase64}')`;
+          document.getElementById('editBookmarkIconPreviewWrapper').style.display = 'block';
+          document.getElementById('editBookmarkIcon').value = ''; 
+        };
+        img.src = objectUrl;
+      }
+      e.target.value = ''; 
+    });
+
+    document.getElementById('removeCustomIconBtn').addEventListener('click', () => {
+      temporaryCustomIconBase64 = null;
+      document.getElementById('editBookmarkIconPreviewWrapper').style.display = 'none';
+      const b = bookmarks.find(x => x.id === editingBookmarkId);
+      if(b && b.customIcon && b.customIcon.startsWith('db:')) b.customIcon = ''; 
+    });
+
+    // Edit Modal Event Listeners
+    const cancelEditBtn = document.getElementById('cancelEditBtn');
+    if (cancelEditBtn) {
+      cancelEditBtn.addEventListener('click', () => {
+        document.getElementById('editBookmarkModal').style.display = 'none';
+        editingBookmarkId = null;
+        temporaryCustomIconBase64 = null;
+      });
+    }
+
+    const saveEditBtn = document.getElementById('saveEditBtn');
+    if (saveEditBtn) {
+      saveEditBtn.addEventListener('click', async () => {
+        if (editingBookmarkId === null) return;
+        const b = bookmarks.find(x => x.id === editingBookmarkId);
+        if (b) {
+          b.name = document.getElementById('editBookmarkName').value.trim();
+          let url = document.getElementById('editBookmarkUrl').value.trim();
+          if (url && !url.startsWith('http')) url = 'https://' + url;
+          
+          // Clear remembered fallback if the domain entirely changed
+          if (b.url !== url) { b.autoFallback = null; }
+          b.url = url;
+          
+          // Save Custom Icon
+          if (temporaryCustomIconBase64) {
+            const dbKey = 'custom_' + b.id;
+            await saveIconToDB(dbKey, temporaryCustomIconBase64);
+            b.customIcon = 'db:' + dbKey;
+          } else {
+            let urlVal = document.getElementById('editBookmarkIcon').value.trim();
+            if (urlVal) b.customIcon = urlVal;
+            else if (!b.customIcon || !b.customIcon.startsWith('db:')) b.customIcon = '';
+          }
+          
+          saveBookmarks(); renderFavorites(); renderAppLibrary();
+        }
+        document.getElementById('editBookmarkModal').style.display = 'none';
+        editingBookmarkId = null;
+        temporaryCustomIconBase64 = null;
+      });
+    }
 
     const toggleAddBtn = document.getElementById('toggleAddPanelBtn');
     const addPanelCollapsible = document.getElementById('addPanelCollapsible');
@@ -360,7 +586,52 @@
       document.getElementById('newBookmarkName').value = ''; document.getElementById('newBookmarkUrl').value = '';
     });
 
-    document.getElementById('searchEngineToggle').addEventListener('click', (e) => { e.stopPropagation(); document.getElementById('searchDropdown').classList.toggle('active'); });
+    // --- ACCESSIBILITY: Dropdown Keyboard Navigation ---
+    const engineToggle = document.getElementById('searchEngineToggle');
+    engineToggle.setAttribute('tabindex', '0'); 
+
+    engineToggle.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault(); e.stopPropagation();
+        document.getElementById('searchDropdown').classList.toggle('active');
+        window.currentEngineIndex = -1; 
+      }
+    });
+
+    engineToggle.addEventListener('click', (e) => { 
+      e.stopPropagation(); 
+      document.getElementById('searchDropdown').classList.toggle('active'); 
+      window.currentEngineIndex = -1;
+    });
+
+    document.addEventListener('keydown', (e) => {
+      const dropdown = document.getElementById('searchDropdown');
+      if (dropdown.classList.contains('active')) {
+        const options = Array.from(dropdown.querySelectorAll('.engine-option'));
+        
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          window.currentEngineIndex = (window.currentEngineIndex !== undefined ? window.currentEngineIndex + 1 : 0) % options.length;
+          options.forEach((opt, i) => opt.style.background = i === window.currentEngineIndex ? 'rgba(255,255,255,0.15)' : '');
+        } 
+        else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          window.currentEngineIndex = (window.currentEngineIndex !== undefined && window.currentEngineIndex > 0 ? window.currentEngineIndex - 1 : options.length - 1);
+          options.forEach((opt, i) => opt.style.background = i === window.currentEngineIndex ? 'rgba(255,255,255,0.15)' : '');
+        } 
+        else if (e.key === 'Enter') {
+          if (window.currentEngineIndex >= 0 && options[window.currentEngineIndex]) {
+            e.preventDefault();
+            options[window.currentEngineIndex].click();
+          }
+        } 
+        else if (e.key === 'Escape') {
+          dropdown.classList.remove('active');
+          engineToggle.focus();
+        }
+      }
+    });
+
     document.addEventListener('click', (e) => {
       if(!e.target.closest('.search-container')) { document.getElementById('searchSuggestions').classList.remove('active'); document.getElementById('searchDropdown').classList.remove('active'); }
     });
@@ -427,54 +698,43 @@
     
         img.onload = async () => {
           URL.revokeObjectURL(objectUrl);
+          const MAX_WIDTH = 2560; const MAX_HEIGHT = 1440;
+          let width = img.width; let height = img.height;
     
-          const MAX_WIDTH = 2560;
-          const MAX_HEIGHT = 1440;
-          let width = img.width;
-          let height = img.height;
-    
-          if (width > height) {
-            if (width > MAX_WIDTH) { height *= MAX_WIDTH / width; width = MAX_WIDTH; }
-          } else {
-            if (height > MAX_HEIGHT) { width *= MAX_HEIGHT / height; height = MAX_HEIGHT; }
-          }
+          if (width > height) { if (width > MAX_WIDTH) { height *= MAX_WIDTH / width; width = MAX_WIDTH; } } 
+          else { if (height > MAX_HEIGHT) { width *= MAX_HEIGHT / height; height = MAX_HEIGHT; } }
     
           const canvas = document.createElement('canvas');
-          canvas.width = width;
-          canvas.height = height;
+          canvas.width = width; canvas.height = height;
           const ctx = canvas.getContext('2d');
           ctx.drawImage(img, 0, 0, width, height);
     
           const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.85);
-    
-          settings.uploadData = compressedDataUrl; 
-          settings.imageUrl = ''; 
+          settings.uploadData = compressedDataUrl; settings.imageUrl = ''; 
           document.getElementById('imagePreview').style.backgroundImage = `url('${compressedDataUrl}')`; 
           document.getElementById('imagePreview').style.display = 'block'; 
           
-          applyThemeAndBackground(); 
-          saveSettings(); 
-          await saveImgToDB(compressedDataUrl); 
+          applyThemeAndBackground(); saveSettings(); await saveImgToDB(compressedDataUrl); 
         };
-    
         img.src = objectUrl;
       } 
     });
     
     document.getElementById('autoThemeToggle').addEventListener('change', (e) => { settings.autoTheme = e.target.checked; document.getElementById('accentColorPickerGroup').style.display = settings.autoTheme ? 'none' : 'block'; applyThemeAndBackground(); saveSettings(); });
     document.getElementById('manualAccentColor').addEventListener('input', (e) => { settings.manualAccentColor = e.target.value; applyThemeAndBackground(); saveSettings(); });
-    document.getElementById('acrylicBlurSlider').addEventListener('input', (e) => { settings.acrylicBlur = e.target.value; document.getElementById('acrylicBlurVal').innerText = settings.acrylicBlur + 'px'; applyThemeAndBackground(); saveSettings(); });
-    document.getElementById('panelCurvatureSlider').addEventListener('input', (e) => { settings.panelCurvature = parseInt(e.target.value); document.getElementById('panelCurvatureVal').innerText = settings.panelCurvature + 'px'; applyThemeAndBackground(); saveSettings(); });
+    
+    document.getElementById('acrylicBlurSlider').addEventListener('input', (e) => { settings.acrylicBlur = e.target.value; document.getElementById('acrylicBlurVal').innerText = settings.acrylicBlur + 'px'; rAFThemeUpdate(); });
+    document.getElementById('panelCurvatureSlider').addEventListener('input', (e) => { settings.panelCurvature = parseInt(e.target.value); document.getElementById('panelCurvatureVal').innerText = settings.panelCurvature + 'px'; rAFThemeUpdate(); });
 
     const pS=document.getElementById('panelScale'), iS=document.getElementById('iconScale');
-    pS.addEventListener('input', (e) => { settings.panelScale=e.target.value; document.getElementById('panelScaleVal').innerText=settings.panelScale; if(settings.syncScale) { settings.iconScale=e.target.value; iS.value=e.target.value; document.getElementById('iconScaleVal').innerText=e.target.value; } applyThemeAndBackground(); saveSettings(); });
-    iS.addEventListener('input', (e) => { settings.iconScale=e.target.value; document.getElementById('iconScaleVal').innerText=settings.iconScale; if(settings.syncScale) { settings.panelScale=e.target.value; pS.value=e.target.value; document.getElementById('panelScaleVal').innerText=e.target.value; } applyThemeAndBackground(); saveSettings(); });
+    pS.addEventListener('input', (e) => { settings.panelScale=e.target.value; document.getElementById('panelScaleVal').innerText=settings.panelScale; if(settings.syncScale) { settings.iconScale=e.target.value; iS.value=e.target.value; document.getElementById('iconScaleVal').innerText=e.target.value; } rAFThemeUpdate(); });
+    iS.addEventListener('input', (e) => { settings.iconScale=e.target.value; document.getElementById('iconScaleVal').innerText=settings.iconScale; if(settings.syncScale) { settings.panelScale=e.target.value; pS.value=e.target.value; document.getElementById('panelScaleVal').innerText=e.target.value; } rAFThemeUpdate(); });
     document.getElementById('syncScaleToggle').addEventListener('change', (e) => { settings.syncScale = e.target.checked; saveSettings(); });
     
     document.querySelectorAll('input[name="panelColorMode"]').forEach(r => r.addEventListener('change', (e) => { settings.panelColorMode = e.target.value; document.getElementById('panelManualColorGroup').style.display = settings.panelColorMode === 'manual' ? 'block' : 'none'; applyThemeAndBackground(); saveSettings(); }));
     document.getElementById('panelManualColor').addEventListener('input', (e) => { settings.panelManualColor = e.target.value; applyThemeAndBackground(); saveSettings(); });
-    document.getElementById('panelOpacitySlider').addEventListener('input', (e) => { settings.panelOpacity = parseFloat(e.target.value); document.getElementById('panelOpacityVal').innerText = settings.panelOpacity.toFixed(2); applyThemeAndBackground(); saveSettings(); });
-    document.getElementById('panelBrightnessSlider').addEventListener('input', (e) => { settings.panelBrightness = parseFloat(e.target.value); document.getElementById('panelBrightnessVal').innerText = settings.panelBrightness.toFixed(1); applyThemeAndBackground(); saveSettings(); });
+    document.getElementById('panelOpacitySlider').addEventListener('input', (e) => { settings.panelOpacity = parseFloat(e.target.value); document.getElementById('panelOpacityVal').innerText = settings.panelOpacity.toFixed(2); rAFThemeUpdate(); });
+    document.getElementById('panelBrightnessSlider').addEventListener('input', (e) => { settings.panelBrightness = parseFloat(e.target.value); document.getElementById('panelBrightnessVal').innerText = settings.panelBrightness.toFixed(1); rAFThemeUpdate(); });
   }
 
   function syncSettingsToUI() {

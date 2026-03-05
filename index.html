@@ -238,6 +238,34 @@
     </div>
   </aside>
 
+  <div class="edit-modal" id="editBookmarkModal" style="display: none;">
+    <div class="edit-modal-content">
+      <h3>Edit Bookmark</h3>
+      <div class="form-group" style="margin-bottom: 0.8rem;">
+        <input type="text" id="editBookmarkName" placeholder="Name (e.g., GitHub)">
+      </div>
+      <div class="form-group" style="margin-bottom: 0.8rem;">
+        <input type="url" id="editBookmarkUrl" placeholder="URL (https://github.com)">
+      </div>
+      
+      <div class="form-group" style="margin-bottom: 0.8rem; display: flex; gap: 8px; align-items: center;">
+        <input type="url" id="editBookmarkIcon" placeholder="Custom Icon URL (Optional)" style="flex: 1;">
+        <button id="uploadIconBtn" class="minimal-btn" title="Upload Local Icon" style="width: 44px; height: 44px; background: rgba(255,255,255,0.1); border-radius: var(--radius-md);"><i class="fas fa-upload"></i></button>
+        <input type="file" id="editBookmarkIconFile" accept="image/*" style="display: none;">
+      </div>
+      
+      <div id="editBookmarkIconPreviewWrapper" style="position:relative; display:none; width: 60px; margin-bottom: 1rem;">
+        <div class="image-preview" id="editBookmarkIconPreview" style="height: 60px; width: 60px; border-radius: var(--radius-md); background-size: contain; background-repeat: no-repeat; background-position: center; background-color: rgba(0,0,0,0.2); margin: 0;"></div>
+        <button id="removeCustomIconBtn" title="Remove Uploaded Icon" style="position:absolute; top:-5px; right:-5px; background:#ff8a8a; color:#1a1e24; border:none; border-radius:50%; width:20px; height:20px; cursor:pointer; font-size:10px;"><i class="fas fa-times"></i></button>
+      </div>
+
+      <div class="edit-modal-actions">
+        <button id="cancelEditBtn">Cancel</button>
+        <button id="saveEditBtn">Save</button>
+      </div>
+    </div>
+  </div>
+
   <div class="overlay" id="overlay"></div>
   <canvas id="colorCanvas" style="display:none;"></canvas>
 
